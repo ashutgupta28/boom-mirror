@@ -32,10 +32,10 @@ import java.nio.file.{Paths}
 
 import chisel3._
 import chisel3.util._
+import chisel3.experimental._
 
 import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.rocket.Instructions._
-import freechips.rocketchip.tile.{TraceBundle}
 import freechips.rocketchip.rocket.{Causes, PRV, TracedInstruction}
 import freechips.rocketchip.util.{Str, UIntIsOneOf, CoreMonitorBundle}
 import freechips.rocketchip.devices.tilelink.{PLICConsts, CLINTConsts}
@@ -60,14 +60,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     val rocc = Flipped(new freechips.rocketchip.tile.RoCCCoreIO())
     val lsu = Flipped(new boom.lsu.LSUCoreIO)
     val ptw_tlb = new freechips.rocketchip.rocket.TLBPTWIO()
-    val trace = Output(new TraceBundle)
+    val trace = Output(Vec(coreParams.retireWidth, new TracedInstruction))
     val fcsr_rm = UInt(freechips.rocketchip.tile.FPConstants.RM_SZ.W)
   }
   //**********************************
   // construct all of the modules
 
   // Only holds integer-registerfile execution units.
-  val exe_units = new boom.exu.ExecutionUnits(fpu=false)
+  val exe_units = new boom.exu.ExecutionUnits(fpu=false, vec=usingVector)
   val jmp_unit_idx = exe_units.jmp_unit_idx
   val jmp_unit = exe_units(jmp_unit_idx)
 
@@ -90,7 +90,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   val numFastWakeupPorts      = exe_units.count(_.bypassable)
   val numAlwaysBypassable     = exe_units.count(_.alwaysBypassable)
 
-  val numIntIssueWakeupPorts  = numIrfWritePorts + numFastWakeupPorts - numAlwaysBypassable // + memWidth for ll_wb
+  val numVecIrfWritePorts     = if (usingVector) 1 else 0
+
+  val numIntIssueWakeupPorts  = numIrfWritePorts + numFastWakeupPorts - numAlwaysBypassable + numVecIrfWritePorts // + memWidth for ll_wb
   val numIntRenameWakeupPorts = numIntIssueWakeupPorts
   val numFpWakeupPorts        = if (usingFPU) fp_pipeline.io.wakeups.length else 0
 
@@ -105,8 +107,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   mem_iss_unit.suggestName("mem_issue_unit")
   val int_iss_unit     = Module(new IssueUnitCollapsing(intIssueParam, numIntIssueWakeupPorts))
   int_iss_unit.suggestName("int_issue_unit")
+  var vec_iss_unit: IssueUnitOrdered = null
+  if (usingVector) {
+    vec_iss_unit = Module(new IssueUnitOrdered(issueParams.find(_.iqType == IQT_VEC.litValue).get, numIntIssueWakeupPorts+numFpWakeupPorts))
+    vec_iss_unit.suggestName("vec_issue_unit")
+  }
 
-  val issue_units      = Seq(mem_iss_unit, int_iss_unit)
+  val issue_units      = if (usingVector) Seq(mem_iss_unit, int_iss_unit, vec_iss_unit)
+                         else             Seq(mem_iss_unit, int_iss_unit)
   val dispatcher       = Module(new BasicDispatcher)
 
   val iregfile         = Module(new RegisterFileSynthesizable(
@@ -138,7 +146,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
                            xLen))
   val rob              = Module(new Rob(
                            numIrfWritePorts + numFpWakeupPorts, // +memWidth for ll writebacks
-                           numFpWakeupPorts))
+                          if (usingVector) numFpWakeupPorts+1 else numFpWakeupPorts))
+
   // Used to wakeup registers in rename and issue. ROB needs to listen to something else.
   val int_iss_wakeups  = Wire(Vec(numIntIssueWakeupPorts, Valid(new ExeUnitResp(xLen))))
   val int_ren_wakeups  = Wire(Vec(numIntRenameWakeupPorts, Valid(new ExeUnitResp(xLen))))
@@ -237,6 +246,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     mem_units(i).io.lsu_io <> io.lsu.exe(i)
   }
 
+  // Vector Execution Unit
+  val vec_exe_unit = if (usingVector) exe_units.vec_exe_unit else null
+  val vec_exe_resp = if (usingVector) vec_exe_unit.io.iresp else null
+  
   //-------------------------------------------------------------
   // Uarch Hardware Performance Events (HPEs)
 
@@ -274,6 +287,12 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //val icache_blocked = !(io.ifu.fetchpacket.valid || RegNext(io.ifu.fetchpacket.valid))
   val icache_blocked = false.B
   csr.io.counters foreach { c => c.inc := RegNext(perfEvents.evaluate(c.eventSel)) }
+
+  if (usingVector) {
+    vec_exe_unit.io.ovi.vconfig := csr.io.vector.get.vconfig
+    vec_exe_unit.io.ovi.vxrm := csr.io.vector.get.vxrm
+    io.lsu.VGen <> vec_exe_unit.io.ovi.vGenIO 
+  }
 
   //****************************************
   // Time Stamp Counter & Retired Instruction Counter
@@ -801,6 +820,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     ren_wu_idx += 1
   }
 
+  if (usingVector) {
+    int_iss_wakeups(iss_wu_idx).valid := vec_exe_resp.valid && vec_exe_resp.bits.uop.dst_rtype === RT_FIX
+    int_iss_wakeups(iss_wu_idx).bits  := vec_exe_resp.bits
+
+    int_ren_wakeups(ren_wu_idx).valid := vec_exe_resp.valid && vec_exe_resp.bits.uop.dst_rtype === RT_FIX
+    int_ren_wakeups(ren_wu_idx).bits  := vec_exe_resp.bits
+
+    iss_wu_idx += 1
+    ren_wu_idx += 1
+  }
+
   // loop through each issue-port (exe_units are statically connected to an issue-port)
   for (i <- 0 until exe_units.length) {
     if (exe_units(i).writesIrf) {
@@ -846,8 +876,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       }
     }
   }
-  require (iss_wu_idx == numIntIssueWakeupPorts)
-  require (ren_wu_idx == numIntRenameWakeupPorts)
+//  require (iss_wu_idx == numIntIssueWakeupPorts)
+//  require (ren_wu_idx == numIntRenameWakeupPorts)
   require (iss_wu_idx == ren_wu_idx)
 
   // jmp unit performs fast wakeup of the predicate bits
@@ -923,6 +953,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
         iss_uops(iss_idx)   := mem_iss_unit.io.iss_uops(mem_iss_cnt)
         mem_iss_unit.io.fu_types(mem_iss_cnt) := Mux(pause_mem, 0.U, fu_types)
         mem_iss_cnt += 1
+      } else
+      if (exe_unit.hasVecExe) {
+        iss_valids(iss_idx) := vec_iss_unit.io.iss_valids(0)
+        iss_uops(iss_idx)   := vec_iss_unit.io.iss_uops(0)
+        vec_iss_unit.io.fu_types(0) := fu_types
       } else {
         iss_valids(iss_idx) := int_iss_unit.io.iss_valids(int_iss_cnt)
         iss_uops(iss_idx)   := int_iss_unit.io.iss_uops(int_iss_cnt)
@@ -946,14 +981,31 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   // Wakeup (Issue & Writeback)
   for {
-    iu <- issue_units
+    iu <- issue_units.filter(_.iqType != IQT_VEC.litValue)
     (issport, wakeup) <- iu.io.wakeup_ports zip int_iss_wakeups
   }{
     issport.valid := wakeup.valid
     issport.bits.pdst := wakeup.bits.uop.pdst
     issport.bits.poisoned := wakeup.bits.uop.iw_p1_poisoned || wakeup.bits.uop.iw_p2_poisoned
+    issport.bits.rtype := RT_FIX
 
     require (iu.io.wakeup_ports.length == int_iss_wakeups.length)
+  }
+
+  if (usingVector) {
+    for (i <- 0 until numIntIssueWakeupPorts) {
+      vec_iss_unit.io.wakeup_ports(i).valid         := int_iss_wakeups(i).valid
+      vec_iss_unit.io.wakeup_ports(i).bits.pdst     := int_iss_wakeups(i).bits.uop.pdst
+      vec_iss_unit.io.wakeup_ports(i).bits.poisoned := int_iss_wakeups(i).bits.uop.iw_p1_poisoned || int_iss_wakeups(i).bits.uop.iw_p2_poisoned
+      vec_iss_unit.io.wakeup_ports(i).bits.rtype    := RT_FIX
+    }
+
+    for (i <- 0 until numFpWakeupPorts) {
+      vec_iss_unit.io.wakeup_ports(i+numIntIssueWakeupPorts).valid         := fp_pipeline.io.wakeups(i).valid
+      vec_iss_unit.io.wakeup_ports(i+numIntIssueWakeupPorts).bits.pdst     := fp_pipeline.io.wakeups(i).bits.uop.pdst
+      vec_iss_unit.io.wakeup_ports(i+numIntIssueWakeupPorts).bits.poisoned := false.B
+      vec_iss_unit.io.wakeup_ports(i+numIntIssueWakeupPorts).bits.rtype    := RT_FLT
+    }
   }
 
   //-------------------------------------------------------------
@@ -963,7 +1015,10 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   //-------------------------------------------------------------
 
   // Register Read <- Issue (rrd <- iss)
-  iregister_read.io.rf_read_ports <> iregfile.io.read_ports
+  for (w <- 0 until numIrfReadPorts) {
+    iregister_read.io.rf_read_ports(w) <> iregfile.io.read_ports(w)
+  }
+
   iregister_read.io.prf_read_ports := DontCare
   if (enableSFBOpt) {
     iregister_read.io.prf_read_ports <> pregfile.io.read_ports
@@ -1058,6 +1113,14 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   csr.io.htval := DontCare
   csr.io.gva := DontCare
 
+  if (usingVector) {
+    csr.io.vector.get.set_vs_dirty := DontCare
+    csr.io.vector.get.set_vtype := exe_units.vec_exe_unit.io.ovi.set_vtype
+    csr.io.vector.get.set_vl := exe_units.vec_exe_unit.io.ovi.set_vl
+    csr.io.vector.get.set_vstart := DontCare
+    csr.io.vector.get.set_vxsat := exe_units.vec_exe_unit.io.ovi.set_vxsat
+  }
+
 // TODO can we add this back in, but handle reset properly and save us
 //      the mux above on csr.io.rw.cmd?
 //   assert (!(csr_rw_cmd =/= rocket.CSR.N && !exe_units(0).io.resp(0).valid),
@@ -1085,9 +1148,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       iss_idx += 1
     }
   }
+
   require (bypass_idx == exe_units.numTotalBypassPorts)
   for (i <- 0 until jmp_unit.numBypassStages) {
     pred_bypasses(i) := jmp_unit.io.bypass(i)
+  }
+
+  if (usingVector) {
+    fp_pipeline.io.vec_frf_read_ports.addr := vec_iss_unit.io.iss_uops(0).prs1
+    vec_exe_unit.io.req.bits.rs3_data      := RegNext(fp_pipeline.io.vec_frf_read_ports.data)
   }
 
   //-------------------------------------------------------------
@@ -1115,6 +1184,7 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   io.lsu.brupdate := brupdate
   io.lsu.rob_head_idx := rob.io.rob_head_idx
   io.lsu.rob_pnr_idx  := rob.io.rob_pnr_idx
+  
 
   io.lsu.tsc_reg := debug_tsc_reg
 
@@ -1186,7 +1256,13 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     ll_wbarb.io.in(1)        <> fp_pipeline.io.to_int
     // Connect FLDs
     fp_pipeline.io.ll_wports <> exe_units.memory_units.map(_.io.ll_fresp).toSeq
+    }
+
+  if (usingVector) {
+    // Connect VecExe
+    fp_pipeline.io.from_vec                <> exe_units.vec_exe_unit.io.ll_fresp
   }
+
   if (usingRoCC) {
     require(usingFPU)
     ll_wbarb.io.in(2)       <> exe_units.rocc_unit.io.ll_iresp
@@ -1206,6 +1282,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   rob.io.wb_resps(0).bits   <> ll_wbarb.io.out.bits
   rob.io.debug_wb_valids(0) := ll_wbarb.io.out.valid && ll_uop.dst_rtype =/= RT_X
   rob.io.debug_wb_wdata(0)  := ll_wbarb.io.out.bits.data
+  rob.io.debug_wb_vec_valids(0) := DontCare
+  rob.io.debug_wb_vec_wdata(0)  := DontCare
+  rob.io.debug_wb_vec_wmask(0)  := DontCare
   var cnt = 1
   for (i <- 1 until memWidth) {
     val mem_uop = mem_resps(i).bits.uop
@@ -1213,6 +1292,9 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     rob.io.wb_resps(cnt).bits  := mem_resps(i).bits
     rob.io.debug_wb_valids(cnt) := mem_resps(i).valid && mem_uop.dst_rtype =/= RT_X
     rob.io.debug_wb_wdata(cnt)  := mem_resps(i).bits.data
+    rob.io.debug_wb_vec_valids(cnt) := DontCare
+    rob.io.debug_wb_vec_wdata(cnt)  := DontCare
+    rob.io.debug_wb_vec_wmask(cnt)  := DontCare
     cnt += 1
   }
   var f_cnt = 0 // rob fflags port index
@@ -1237,6 +1319,15 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       } else {
         rob.io.debug_wb_wdata(cnt) := data
       }
+      if (eu.hasVecExe) {
+        rob.io.debug_wb_vec_valids(cnt) := eu.io.ovi.debug_wb_vec_valid
+        rob.io.debug_wb_vec_wdata(cnt)  := eu.io.ovi.debug_wb_vec_wdata
+        rob.io.debug_wb_vec_wmask(cnt)  := eu.io.ovi.debug_wb_vec_wmask
+      } else {
+        rob.io.debug_wb_vec_valids(cnt) := 0.B
+        rob.io.debug_wb_vec_wdata(cnt)  := 0.U
+        rob.io.debug_wb_vec_wmask(cnt)  := 0.U
+      }
       cnt += 1
     }
   }
@@ -1248,14 +1339,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       rob.io.fflags(f_cnt) <> wakeup.bits.fflags
       rob.io.debug_wb_valids(cnt) := wakeup.valid
       rob.io.debug_wb_wdata(cnt) := wdata
+      rob.io.debug_wb_vec_valids(cnt) := 0.B
+      rob.io.debug_wb_vec_wdata(cnt) := 0.U
+      rob.io.debug_wb_vec_wmask(cnt) := 0.U
       cnt += 1
       f_cnt += 1
 
-      assert (!(wakeup.valid && wakeup.bits.uop.dst_rtype =/= RT_FLT),
-        "[core] FP wakeup does not write back to a FP register.")
+      //assert (!(wakeup.valid && wakeup.bits.uop.dst_rtype =/= RT_FLT),
+      //  "[core] FP wakeup does not write back to a FP register.")
 
-      assert (!(wakeup.valid && !wakeup.bits.uop.fp_val),
-        "[core] FP wakeup does not involve an FP instruction.")
+      //assert (!(wakeup.valid && !wakeup.bits.uop.fp_val),
+      //  "[core] FP wakeup does not involve an FP instruction.")
     }
   }
 
@@ -1320,6 +1414,155 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
   if (usingFPU) {
     fp_pipeline.io.debug_tsc_reg := debug_tsc_reg
   }
+
+  //-------------------------------------------------------------
+  //-------------------------------------------------------------
+  // **** Connect debugging harness for DV bridge ****
+  //-------------------------------------------------------------
+  //-------------------------------------------------------------
+  if (DEBUG_HARNESS) {
+     if (coreParams.retireWidth == 1) {
+       val harness_1 = Module(new BoomCoreHarnessWrapper_1(coreParams.vLen))
+                     
+       harness_1.io.clock        := clock.asBool
+       harness_1.io.reset        := reset.asBool
+       harness_1.io.hartid       := io.hartid
+
+       harness_1.io.csrwr.cmd   := csr.io.rw.cmd
+       harness_1.io.csrwr.addr  := csr.io.rw.addr
+       harness_1.io.csrwr.wdata := csr.io.rw.wdata    
+       harness_1.io.csrwr.rdata := csr.io.rw.rdata    
+
+       for (w <- 0 until 1) {
+          harness_1.io.commit.arch_valids(w)      := rob.io.commit.arch_valids(w)
+          harness_1.io.commit.uops(w).debug_pc    := rob.io.commit.uops(w).debug_pc(vaddrBits-1,0)
+          harness_1.io.commit.uops(w).debug_tag   := rob.io.commit.uops(w).debug_tag
+          harness_1.io.commit.uops(w).debug_inst  := rob.io.commit.uops(w).debug_inst
+          harness_1.io.commit.uops(w).dst_rtype   := rob.io.commit.uops(w).dst_rtype
+          harness_1.io.commit.uops(w).ldst        := rob.io.commit.uops(w).ldst
+          harness_1.io.commit.uops(w).debug_wdata := rob.io.commit.debug_wdata(w)
+          harness_1.io.commit.uops(w).debug_vec_wdata := rob.io.commit.debug_vec_wdata(w)
+          harness_1.io.commit.uops(w).debug_vec_wmask := rob.io.commit.debug_vec_wmask(w)
+       }
+     } else if (coreParams.retireWidth == 2) {
+       val harness_2 = Module(new BoomCoreHarnessWrapper_2(coreParams.vLen))
+                     
+       harness_2.io.clock        := clock.asBool
+       harness_2.io.reset        := reset.asBool
+       harness_2.io.hartid       := io.hartid
+       
+       harness_2.io.csrwr.cmd   := csr.io.rw.cmd
+       harness_2.io.csrwr.addr  := csr.io.rw.addr
+       harness_2.io.csrwr.wdata := csr.io.rw.wdata    
+       harness_2.io.csrwr.rdata := csr.io.rw.rdata    
+
+       for (w <- 0 until 2) {
+          harness_2.io.commit.arch_valids(w)      := rob.io.commit.arch_valids(w)
+          harness_2.io.commit.uops(w).debug_pc    := rob.io.commit.uops(w).debug_pc(vaddrBits-1,0)
+          harness_2.io.commit.uops(w).debug_tag   := rob.io.commit.uops(w).debug_tag
+          harness_2.io.commit.uops(w).debug_inst  := rob.io.commit.uops(w).debug_inst
+          harness_2.io.commit.uops(w).dst_rtype   := rob.io.commit.uops(w).dst_rtype
+          harness_2.io.commit.uops(w).ldst        := rob.io.commit.uops(w).ldst
+          harness_2.io.commit.uops(w).debug_wdata := rob.io.commit.debug_wdata(w)
+          harness_2.io.commit.uops(w).debug_vec_wdata := rob.io.commit.debug_vec_wdata(w)
+          harness_2.io.commit.uops(w).debug_vec_wmask := rob.io.commit.debug_vec_wmask(w)
+       }
+     } else if (coreParams.retireWidth == 3) {
+       val harness_3 = Module(new BoomCoreHarnessWrapper_3(coreParams.vLen))
+                     
+       harness_3.io.clock        := clock.asBool
+       harness_3.io.reset        := reset.asBool
+       harness_3.io.hartid       := io.hartid
+       
+       harness_3.io.csrwr.cmd   := csr.io.rw.cmd
+       harness_3.io.csrwr.addr  := csr.io.rw.addr
+       harness_3.io.csrwr.wdata := csr.io.rw.wdata    
+       harness_3.io.csrwr.rdata := csr.io.rw.rdata    
+
+       for (w <- 0 until 3) {
+          harness_3.io.commit.arch_valids(w)      := rob.io.commit.arch_valids(w)
+          harness_3.io.commit.uops(w).debug_pc    := rob.io.commit.uops(w).debug_pc(vaddrBits-1,0)
+          harness_3.io.commit.uops(w).debug_tag   := rob.io.commit.uops(w).debug_tag
+          harness_3.io.commit.uops(w).debug_inst  := rob.io.commit.uops(w).debug_inst
+          harness_3.io.commit.uops(w).dst_rtype   := rob.io.commit.uops(w).dst_rtype
+          harness_3.io.commit.uops(w).ldst        := rob.io.commit.uops(w).ldst
+          harness_3.io.commit.uops(w).debug_wdata := rob.io.commit.debug_wdata(w)
+          harness_3.io.commit.uops(w).debug_vec_wdata := rob.io.commit.debug_vec_wdata(w)
+          harness_3.io.commit.uops(w).debug_vec_wmask := rob.io.commit.debug_vec_wmask(w)
+       }
+     } else if (coreParams.retireWidth == 4) {
+       val harness_4 = Module(new BoomCoreHarnessWrapper_4(coreParams.vLen))
+                     
+       harness_4.io.clock        := clock.asBool
+       harness_4.io.reset        := reset.asBool
+       harness_4.io.hartid       := io.hartid
+       
+       harness_4.io.csrwr.cmd   := csr.io.rw.cmd
+       harness_4.io.csrwr.addr  := csr.io.rw.addr
+       harness_4.io.csrwr.wdata := csr.io.rw.wdata    
+       harness_4.io.csrwr.rdata := csr.io.rw.rdata    
+
+       for (w <- 0 until 4) {
+          harness_4.io.commit.arch_valids(w)      := rob.io.commit.arch_valids(w)
+          harness_4.io.commit.uops(w).debug_pc    := rob.io.commit.uops(w).debug_pc(vaddrBits-1,0)
+          harness_4.io.commit.uops(w).debug_tag   := rob.io.commit.uops(w).debug_tag
+          harness_4.io.commit.uops(w).debug_inst  := rob.io.commit.uops(w).debug_inst
+          harness_4.io.commit.uops(w).dst_rtype   := rob.io.commit.uops(w).dst_rtype
+          harness_4.io.commit.uops(w).ldst        := rob.io.commit.uops(w).ldst
+          harness_4.io.commit.uops(w).debug_wdata := rob.io.commit.debug_wdata(w)
+          harness_4.io.commit.uops(w).debug_vec_wdata := rob.io.commit.debug_vec_wdata(w)
+          harness_4.io.commit.uops(w).debug_vec_wmask := rob.io.commit.debug_vec_wmask(w)
+       }
+     } else if (coreParams.retireWidth == 6) {
+       val harness_6 = Module(new BoomCoreHarnessWrapper_6(coreParams.vLen))
+                     
+       harness_6.io.clock        := clock.asBool
+       harness_6.io.reset        := reset.asBool
+       harness_6.io.hartid       := io.hartid
+       
+       harness_6.io.csrwr.cmd   := csr.io.rw.cmd
+       harness_6.io.csrwr.addr  := csr.io.rw.addr
+       harness_6.io.csrwr.wdata := csr.io.rw.wdata    
+       harness_6.io.csrwr.rdata := csr.io.rw.rdata    
+
+       for (w <- 0 until 6) {
+          harness_6.io.commit.arch_valids(w)      := rob.io.commit.arch_valids(w)
+          harness_6.io.commit.uops(w).debug_pc    := rob.io.commit.uops(w).debug_pc(vaddrBits-1,0)
+          harness_6.io.commit.uops(w).debug_tag   := rob.io.commit.uops(w).debug_tag
+          harness_6.io.commit.uops(w).debug_inst  := rob.io.commit.uops(w).debug_inst
+          harness_6.io.commit.uops(w).dst_rtype   := rob.io.commit.uops(w).dst_rtype
+          harness_6.io.commit.uops(w).ldst        := rob.io.commit.uops(w).ldst
+          harness_6.io.commit.uops(w).debug_wdata := rob.io.commit.debug_wdata(w)
+          harness_6.io.commit.uops(w).debug_vec_wdata := rob.io.commit.debug_vec_wdata(w)
+          harness_6.io.commit.uops(w).debug_vec_wmask := rob.io.commit.debug_vec_wmask(w)
+       }
+     } else if (coreParams.retireWidth == 8) {
+       val harness_8 = Module(new BoomCoreHarnessWrapper_8(coreParams.vLen))
+                     
+       harness_8.io.clock        := clock.asBool
+       harness_8.io.reset        := reset.asBool
+       harness_8.io.hartid       := io.hartid
+       
+       harness_8.io.csrwr.cmd   := csr.io.rw.cmd
+       harness_8.io.csrwr.addr  := csr.io.rw.addr
+       harness_8.io.csrwr.wdata := csr.io.rw.wdata    
+       harness_8.io.csrwr.rdata := csr.io.rw.rdata    
+
+       for (w <- 0 until 8) {
+          harness_8.io.commit.arch_valids(w)      := rob.io.commit.arch_valids(w)
+          harness_8.io.commit.uops(w).debug_pc    := rob.io.commit.uops(w).debug_pc(vaddrBits-1,0)
+          harness_8.io.commit.uops(w).debug_tag   := rob.io.commit.uops(w).debug_tag
+          harness_8.io.commit.uops(w).debug_inst  := rob.io.commit.uops(w).debug_inst
+          harness_8.io.commit.uops(w).dst_rtype   := rob.io.commit.uops(w).dst_rtype
+          harness_8.io.commit.uops(w).ldst        := rob.io.commit.uops(w).ldst
+          harness_8.io.commit.uops(w).debug_wdata := rob.io.commit.debug_wdata(w)
+          harness_8.io.commit.uops(w).debug_vec_wdata := rob.io.commit.debug_vec_wdata(w)
+          harness_8.io.commit.uops(w).debug_vec_wmask := rob.io.commit.debug_vec_wmask(w)
+       }
+     }
+  }
+
+
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
@@ -1407,6 +1650,11 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
   //-------------------------------------------------------------
   //-------------------------------------------------------------
+  if (usingVector) {
+    exe_units.vec_exe_unit.io.ovi.rob_pnr_idx := rob.io.rob_pnr_idx
+    exe_units.vec_exe_unit.io.ovi.rob_head_idx := rob.io.rob_head_idx
+    exe_units.vec_exe_unit.io.ovi.exception := csr.io.exception && csr.io.status.xs.orR
+  }
 
   io.rocc := DontCare
   io.rocc.exception := csr.io.exception && csr.io.status.xs.orR
@@ -1427,22 +1675,17 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
     }
   }
 
-  io.trace := DontCare
-  io.trace.time := csr.io.time
-  io.trace.insns map (t => t.valid := false.B)
-  io.trace.custom.get.asInstanceOf[BoomTraceBundle].rob_empty := rob.io.empty
-
   if (trace) {
     for (w <- 0 until coreWidth) {
       // Delay the trace so we have a cycle to pull PCs out of the FTQ
-      io.trace.insns(w).valid      := RegNext(rob.io.commit.arch_valids(w))
+      io.trace(w).valid      := RegNext(rob.io.commit.arch_valids(w))
 
       // Recalculate the PC
       io.ifu.debug_ftq_idx(w) := rob.io.commit.uops(w).ftq_idx
       val iaddr = (AlignPCToBoundary(io.ifu.debug_fetch_pc(w), icBlockBytes)
                    + RegNext(rob.io.commit.uops(w).pc_lob)
                    - Mux(RegNext(rob.io.commit.uops(w).edge_inst), 2.U, 0.U))(vaddrBits-1,0)
-      io.trace.insns(w).iaddr      := Sext(iaddr, xLen)
+      io.trace(w).iaddr      := Sext(iaddr, xLen)
 
       def getInst(uop: MicroOp, inst: UInt): UInt = {
         Mux(uop.is_rvc, Cat(0.U(16.W), inst(15,0)), inst)
@@ -1454,8 +1697,8 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
 
       // use debug_insts instead of uop.debug_inst to use the rob's debug_inst_mem
       // note: rob.debug_insts comes 1 cycle later
-      io.trace.insns(w).insn       := getInst(RegNext(rob.io.commit.uops(w)), rob.io.commit.debug_insts(w))
-      io.trace.insns(w).wdata.map { _ := RegNext(getWdata(rob.io.commit.uops(w), rob.io.commit.debug_wdata(w))) }
+      io.trace(w).insn       := getInst(RegNext(rob.io.commit.uops(w)), rob.io.commit.debug_insts(w))
+      io.trace(w).wdata.map { _ := RegNext(getWdata(rob.io.commit.uops(w), rob.io.commit.debug_wdata(w))) }
 
       // Comment out this assert because it blows up FPGA synth-asserts
       // This tests correctedness of the debug_inst mem
@@ -1464,20 +1707,114 @@ class BoomCore()(implicit p: Parameters) extends BoomModule
       // }
       // This tests correctedness of recovering pcs through ftq debug ports
       // when (RegNext(rob.io.commit.valids(w))) {
-      //   assert(Sext(io.trace.insns(w).iaddr, xLen) ===
+      //   assert(Sext(io.trace(w).iaddr, xLen) ===
       //     RegNext(Sext(rob.io.commit.uops(w).debug_pc(vaddrBits-1,0), xLen)))
       // }
 
       // These csr signals do not exactly match up with the ROB commit signals.
-      io.trace.insns(w).priv       := RegNext(Cat(RegNext(csr.io.status.debug), csr.io.status.prv))
+      io.trace(w).priv       := RegNext(Cat(RegNext(csr.io.status.debug), csr.io.status.prv))
       // Can determine if it is an interrupt or not based on the MSB of the cause
-      io.trace.insns(w).exception  := RegNext(rob.io.com_xcpt.valid && !rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
-      io.trace.insns(w).interrupt  := RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
-      io.trace.insns(w).cause      := RegNext(rob.io.com_xcpt.bits.cause)
-      io.trace.insns(w).tval       := RegNext(csr.io.tval)
+      io.trace(w).exception  := RegNext(rob.io.com_xcpt.valid && !rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
+      io.trace(w).interrupt  := RegNext(rob.io.com_xcpt.valid && rob.io.com_xcpt.bits.cause(xLen - 1)) && (w == 0).B
+      io.trace(w).cause      := RegNext(rob.io.com_xcpt.bits.cause)
+      io.trace(w).tval       := RegNext(csr.io.tval)
     }
     dontTouch(io.trace)
   } else {
+    io.trace := DontCare
+    io.trace map (t => t.valid := false.B)
     io.ifu.debug_ftq_idx := DontCare
   }
+}
+
+class CSRWrite(val xLen: Int) extends Bundle
+{
+  val cmd   = UInt(3.W) // 0:Nop, 2:Read, 4:SystemInsn, 5:Write, 6:Set, 7:Clear
+  val addr  = UInt(12.W)
+  val wdata = Bits(xLen.W)
+  val rdata = Bits(xLen.W)
+}
+
+class BoomCoreHarnessWrapper_1(val vlen: Int) extends BlackBox(Map("VLEN" -> IntParam(vlen)))
+with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Bool())
+    val reset = Input(Bool())
+    val hartid = Input(UInt(8.W))
+    val commit = Input(new DebugCommitSignals(40, 1, 64, vlen, 5, 1))
+    val csrwr = Input(new CSRWrite(64))
+  })
+  addResource("/vsrc/core_harness_interface.v")
+  addResource("/vsrc/core_harness.v")
+  addResource("/vsrc/core_harness_wrapper_1.v")
+}
+
+class BoomCoreHarnessWrapper_2(val vlen: Int) extends BlackBox(Map("VLEN" -> IntParam(vlen)))
+with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Bool())
+    val reset = Input(Bool())
+    val hartid = Input(UInt(8.W))
+    val commit = Input(new DebugCommitSignals(40, 2, 64, vlen, 5, 1))
+    val csrwr = Input(new CSRWrite(64))
+  })
+  addResource("/vsrc/core_harness_interface.v")
+  addResource("/vsrc/core_harness.v")
+  addResource("/vsrc/core_harness_wrapper_2.v")
+}
+
+class BoomCoreHarnessWrapper_3(val vlen: Int) extends BlackBox(Map("VLEN" -> IntParam(vlen)))
+with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Bool())
+    val reset = Input(Bool())
+    val hartid = Input(UInt(8.W))
+    val commit = Input(new DebugCommitSignals(40, 3, 64, vlen, 5, 1))
+    val csrwr = Input(new CSRWrite(64))
+  })
+  addResource("/vsrc/core_harness_interface.v")
+  addResource("/vsrc/core_harness.v")
+  addResource("/vsrc/core_harness_wrapper_3.v")
+}
+
+class BoomCoreHarnessWrapper_4(val vlen: Int) extends BlackBox(Map("VLEN" -> IntParam(vlen)))
+with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Bool())
+    val reset = Input(Bool())
+    val hartid = Input(UInt(8.W))
+    val commit = Input(new DebugCommitSignals(40, 4, 64, vlen, 5, 2))
+    val csrwr = Input(new CSRWrite(64))
+  })
+  addResource("/vsrc/core_harness_interface.v")
+  addResource("/vsrc/core_harness.v")
+  addResource("/vsrc/core_harness_wrapper_4.v")
+}
+
+class BoomCoreHarnessWrapper_6(val vlen: Int) extends BlackBox(Map("VLEN" -> IntParam(vlen)))
+with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Bool())
+    val reset = Input(Bool())
+    val hartid = Input(UInt(8.W))
+    val commit = Input(new DebugCommitSignals(40, 6, 64, vlen, 5, 2))
+    val csrwr = Input(new CSRWrite(64))
+  })
+  addResource("/vsrc/core_harness_interface.v")
+  addResource("/vsrc/core_harness.v")
+  addResource("/vsrc/core_harness_wrapper_6.v")
+}
+
+class BoomCoreHarnessWrapper_8(val vlen: Int) extends BlackBox(Map("VLEN" -> IntParam(vlen)))
+with HasBlackBoxResource {
+  val io = IO(new Bundle {
+    val clock = Input(Bool())
+    val reset = Input(Bool())
+    val hartid = Input(UInt(8.W))
+    val commit = Input(new DebugCommitSignals(40, 8, 64, vlen, 5, 2))
+    val csrwr = Input(new CSRWrite(64))
+  })
+  addResource("/vsrc/core_harness_interface.v")
+  addResource("/vsrc/core_harness.v")
+  addResource("/vsrc/core_harness_wrapper_8.v")
 }

@@ -828,7 +828,7 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
 
   val loadgen = (0 until memWidth).map { w =>
     new LoadGen(s2_req(w).uop.mem_size, s2_req(w).uop.mem_signed, s2_req(w).addr,
-                s2_data_word(w), s2_sc && (w == 0).B, wordBytes)
+                s2_data_word(w), s2_sc && (w == 0).B, coreDataBytes)
   }
   // Mux between cache responses and uncache responses
   val cache_resp   = Wire(Vec(memWidth, Valid(new BoomDCacheResp)))
@@ -839,15 +839,19 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
     cache_resp(w).bits.is_hella := s2_req(w).is_hella
   }
 
+  val stall_uncache_resp = mshrs.io.resp.valid &&
+                           mshrs.io.resp.bits.uop.is_vec &&
+                           (0 until memWidth).map(w => cache_resp(w).valid && cache_resp(w).bits.uop.is_vec).reduce(_ || _)
+
   val uncache_resp = Wire(Valid(new BoomDCacheResp))
   uncache_resp.bits     := mshrs.io.resp.bits
   uncache_resp.valid    := mshrs.io.resp.valid
-  mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) // We can backpressure the MSHRs, but not cache hits
+  mshrs.io.resp.ready := !(cache_resp.map(_.valid).reduce(_&&_)) && !stall_uncache_resp // We can backpressure the MSHRs, but not cache hits
 
   val resp = WireInit(cache_resp)
   var uncache_responding = false.B
   for (w <- 0 until memWidth) {
-    val uncache_respond = !cache_resp(w).valid && !uncache_responding
+    val uncache_respond = !cache_resp(w).valid && !uncache_responding && !stall_uncache_resp
     when (uncache_respond) {
       resp(w) := uncache_resp
     }
@@ -894,8 +898,8 @@ class BoomNonBlockingDCacheModule(outer: BoomNonBlockingDCache) extends LazyModu
                        Mux(s5_bypass(w), s5_req.data,
                                          s2_data_word_prebypass(w))))
   }
-  val amoalu   = Module(new AMOALU(xLen))
-  amoalu.io.mask := new StoreGen(s2_req(0).uop.mem_size, s2_req(0).addr, 0.U, xLen/8).mask
+  val amoalu   = Module(new AMOALU(coreDataBits))
+  amoalu.io.mask := new StoreGen(s2_req(0).uop.mem_size, s2_req(0).addr, 0.U, coreDataBytes).mask
   amoalu.io.cmd  := s2_req(0).uop.mem_cmd
   amoalu.io.lhs  := s2_data_word(0)
   amoalu.io.rhs  := s2_req(0).data

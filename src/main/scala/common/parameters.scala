@@ -97,16 +97,19 @@ case class BoomCoreParams(
   mcontextWidth: Int = 0,
   scontextWidth: Int = 0,
   trace: Boolean = false,
+  enableVector: Boolean = false,
+  setvLen: Int = 128,
+  setvMemDataBits: Int = 64,
 
   /* debug stuff */
   enableCommitLogPrintf: Boolean = false,
   enableBranchPrintf: Boolean = false,
-  enableMemtracePrintf: Boolean = false
+  enableMemtracePrintf: Boolean = false,
+  enableDebugHarness: Boolean = false
 
 // DOC include end: BOOM Parameters
 ) extends freechips.rocketchip.tile.CoreParams
 {
-  override def traceCustom = Some(new BoomTraceBundle)
   val haveFSDirty = true
   val pmpGranularity: Int = 4
   val instBits: Int = 16
@@ -118,13 +121,13 @@ case class BoomCoreParams(
   val useCryptoNIST = false
   val useCryptoSM = false
   val traceHasWdata = trace
-  val useConditionalZero = false
+val useConditionalZero: Boolean = false  
 
   override def customCSRs(implicit p: Parameters) = new BoomCustomCSRs
-}
+  override val useVector: Boolean = enableVector
+  override def vLen: Int = setvLen
+  override def vMemDataBits: Int = setvMemDataBits
 
-class BoomTraceBundle extends Bundle {
-  val rob_empty = Bool()
 }
 
 /**
@@ -293,6 +296,7 @@ trait HasBoomCoreParameters extends freechips.rocketchip.tile.HasCoreParameters
   val COMMIT_LOG_PRINTF   = boomParams.enableCommitLogPrintf // dump commit state, for comparision against ISA sim
   val BRANCH_PRINTF       = boomParams.enableBranchPrintf // dump branch predictor results
   val MEMTRACE_PRINTF     = boomParams.enableMemtracePrintf // dump trace of memory accesses to L1D for debugging
+  val DEBUG_HARNESS       = boomParams.enableDebugHarness // Attach Debug Harness to Cores
 
   //************************************
   // Other Non/Should-not-be sythesizable modules
