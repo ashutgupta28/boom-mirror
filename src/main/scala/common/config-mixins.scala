@@ -79,6 +79,31 @@ class WithRationalBoomTiles extends Config((site, here, up) => {
   }
 })
 
+class WithBoomDebugHarness extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+      enableDebugHarness = true
+    )))
+    case other => other
+  }
+})
+
+class WithVector(coreWidth: Int = 1) extends Config((site, here, up) => {
+  case TilesLocated(InSubsystem) => up(TilesLocated(InSubsystem), site) map {
+    case tp: BoomTileAttachParams => 
+      // Extract rowBits from DCacheParams
+      val rowBits = tp.tileParams.dcache.map(_.rowBits).getOrElse(0)
+      tp.copy(tileParams = tp.tileParams.copy(core = tp.tileParams.core.copy(
+        enableVector = true,
+        setvLen = 256,
+        setvMemDataBits = rowBits,   // Use the extracted value here
+        issueParams = tp.tileParams.core.issueParams :+ 
+              IssueParams(issueWidth=1, numEntries=32, iqType=IQT_VEC.litValue, dispatchWidth=coreWidth)
+      )))
+    case other => other
+  }
+})
+
 /**
  * 1-wide BOOM.
  */

@@ -80,6 +80,10 @@ class RobIo(
   val debug_wb_valids = Input(Vec(numWakeupPorts, Bool()))
   val debug_wb_wdata  = Input(Vec(numWakeupPorts, Bits(xLen.W)))
 
+  val debug_wb_vec_valids = Input(Vec(numWakeupPorts, Bool()))
+  val debug_wb_vec_wdata  = Input(Vec(numWakeupPorts, Bits((coreParams.vLen*8).W)))
+  val debug_wb_vec_wmask  = Input(Vec(numWakeupPorts, Bits(8.W)))
+
   val fflags = Flipped(Vec(numFpuPorts, new ValidIO(new FFlagsResp())))
   val lxcpt = Flipped(new ValidIO(new Exception())) // LSU
 
@@ -129,6 +133,17 @@ class CommitSignals(implicit p: Parameters) extends BoomBundle
   val rollback   = Bool()
 
   val debug_wdata = Vec(retireWidth, UInt(xLen.W))
+  val debug_vec_wdata = Vec(retireWidth, UInt((coreParams.vLen*8).W))
+  val debug_vec_wmask = Vec(retireWidth, UInt(8.W))
+}
+
+/**
+ * Commit signals for Debug Harness
+ */
+class DebugCommitSignals(val coreMaxAddrBits: Int, val retireWidth: Int, val xLen: Int, val vLen: Int, val lregSz: Int, val memWidth: Int) extends Bundle
+{
+  val arch_valids = Vec(retireWidth, Bool())
+  val uops        = Vec(retireWidth, new DebugMicroOp(coreMaxAddrBits, xLen, vLen, lregSz))
 }
 
 /**
@@ -298,8 +313,6 @@ class Rob(
   rob_debug_inst_mem.write(rob_tail, rob_debug_inst_wdata, rob_debug_inst_wmask)
   val rob_debug_inst_rdata = rob_debug_inst_mem.read(rob_head, will_commit.reduce(_||_))
 
-  val rob_fflags    = Seq.fill(coreWidth)(Reg(Vec(numRobRows, UInt(freechips.rocketchip.tile.FPConstants.FLAGS_SZ.W))))
-
   for (w <- 0 until coreWidth) {
     def MatchBank(bank_idx: UInt): Bool = (bank_idx === w.U)
 
@@ -310,8 +323,11 @@ class Rob(
     val rob_uop       = Reg(Vec(numRobRows, new MicroOp()))
     val rob_exception = Reg(Vec(numRobRows, Bool()))
     val rob_predicated = Reg(Vec(numRobRows, Bool())) // Was this instruction predicated out?
+    val rob_fflags    = Mem(numRobRows, Bits(freechips.rocketchip.tile.FPConstants.FLAGS_SZ.W))
 
     val rob_debug_wdata = Mem(numRobRows, UInt(xLen.W))
+    val rob_debug_vec_wdata = Mem(numRobRows, UInt((coreParams.vLen*8).W))
+    val rob_debug_vec_wmask = Mem(numRobRows, UInt(8.W))
 
     //-----------------------------------------------
     // Dispatch: Add Entry to ROB
@@ -327,7 +343,7 @@ class Rob(
       rob_uop(rob_tail)       := io.enq_uops(w)
       rob_exception(rob_tail) := io.enq_uops(w).exception
       rob_predicated(rob_tail)   := false.B
-      rob_fflags(w)(rob_tail)    := 0.U
+      rob_fflags(rob_tail)    := 0.U
 
       assert (rob_val(rob_tail) === false.B, "[rob] overwriting a valid entry.")
       assert ((io.enq_uops(w).rob_idx >> log2Ceil(coreWidth)) === rob_tail)
@@ -378,7 +394,7 @@ class Rob(
     for (i <- 0 until numFpuPorts) {
       val fflag_uop = io.fflags(i).bits.uop
       when (io.fflags(i).valid && MatchBank(GetBankIdx(fflag_uop.rob_idx))) {
-        rob_fflags(w)(GetRowIdx(fflag_uop.rob_idx)) := io.fflags(i).bits.flags
+        rob_fflags(GetRowIdx(fflag_uop.rob_idx)) := io.fflags(i).bits.flags
       }
     }
 
@@ -479,7 +495,7 @@ class Rob(
     // Outputs
     rob_head_vals(w)     := rob_val(rob_head)
     rob_tail_vals(w)     := rob_val(rob_tail)
-    rob_head_fflags(w)   := rob_fflags(w)(rob_head)
+    rob_head_fflags(w)   := rob_fflags(rob_head)
     rob_head_uses_stq(w) := rob_uop(rob_head).uses_stq
     rob_head_uses_ldq(w) := rob_uop(rob_head).uses_ldq
 
@@ -508,6 +524,12 @@ class Rob(
       when (io.debug_wb_valids(i) && MatchBank(GetBankIdx(rob_idx))) {
         rob_debug_wdata(GetRowIdx(rob_idx)) := io.debug_wb_wdata(i)
       }
+      when (io.debug_wb_vec_valids(i) && MatchBank(GetBankIdx(rob_idx))) {
+        rob_debug_vec_wdata(GetRowIdx(rob_idx)) := io.debug_wb_vec_wdata(i)
+      }
+      when (io.debug_wb_vec_valids(i) && MatchBank(GetBankIdx(rob_idx))) {
+        rob_debug_vec_wmask(GetRowIdx(rob_idx)) := io.debug_wb_vec_wmask(i)
+      }
       val temp_uop = rob_uop(GetRowIdx(rob_idx))
 
       assert (!(io.wb_resps(i).valid && MatchBank(GetBankIdx(rob_idx)) &&
@@ -521,6 +543,10 @@ class Rob(
                "[rob] writeback (" + i + ") occurred to the wrong pdst.")
     }
     io.commit.debug_wdata(w) := rob_debug_wdata(rob_head)
+
+    io.commit.debug_vec_wdata(w) := rob_debug_vec_wdata(rob_head)
+
+    io.commit.debug_vec_wmask(w) := rob_debug_vec_wmask(rob_head)
 
   } //for (w <- 0 until coreWidth)
 
